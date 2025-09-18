@@ -10,7 +10,7 @@ import express from "express";
 import cors from "cors";
 import chatRoutes from "./routes/chatRoutes.js";
 import sessionRoutes from "./routes/sessionRoutes.js";
-import featuredRoute from "./routes/featured.js";
+import featuredRoute from "./routes/featuredRoutes.js";
 
 const app = express();
 
