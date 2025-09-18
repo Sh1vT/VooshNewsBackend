@@ -164,8 +164,8 @@ export async function askGemini(query, context, options = {}) {
   const model = initClient();
   const prompt = `Answer the following query using ONLY the context provided. Include sources.\n\nContext:\n${context}\n\nQuestion: ${query}`;
 
-  console.log("[GEMINI] prompt length:", prompt.length);
-  console.log("[GEMINI] prompt preview:", (prompt || "").slice(0, 1200));
+  // console.log("[GEMINI] prompt length:", prompt.length);
+  // console.log("[GEMINI] prompt preview:", (prompt || "").slice(0, 1200));
 
   try {
     const raw = await callModelWithManySignatures(model, prompt);
@@ -174,30 +174,30 @@ export async function askGemini(query, context, options = {}) {
       const msg = "[GEMINI] no supported model method returned a value (checked many signatures)";
       console.error(msg);
       if (debug) {
-        console.log("FULL PROMPT (debug):\n", prompt);
-        console.log("RAW MODEL RESPONSE: null");
+        // console.log("FULL PROMPT (debug):\n", prompt);
+        // console.log("RAW MODEL RESPONSE: null");
         return { error: msg, prompt, raw: null };
       }
       return "Sorry — the model client did not return a response (no supported method).";
     }
 
     const text = extractTextFromResponse(raw);
-    console.log("[GEMINI] extracted response length:", text ? text.length : 0);
+    // console.log("[GEMINI] extracted response length:", text ? text.length : 0);
 
     if (text) {
-      console.log("========= GEMINI RESPONSE =========\n", text, "\n==================================");
+      // console.log("========= GEMINI RESPONSE =========\n", text, "\n==================================");
     }
 
     if (debug) {
       // print full prompt and the extracted text (or raw fallback)
-      console.log("========== GEMINI DEBUG OUTPUT ==========");
-      console.log("FULL PROMPT SENT TO GEMINI:\n", prompt);
+      // console.log("========== GEMINI DEBUG OUTPUT ==========");
+      // console.log("FULL PROMPT SENT TO GEMINI:\n", prompt);
       if (text && text.trim()) {
-        console.log("\nEXTRACTED TEXT RESPONSE:\n", text);
+        // console.log("\nEXTRACTED TEXT RESPONSE:\n", text);
       } else {
-        console.log("\nCOULD NOT EXTRACT TEXT - RAW RESPONSE FOLLOWS:\n", safeStringify(raw, 200000));
+        // console.log("\nCOULD NOT EXTRACT TEXT - RAW RESPONSE FOLLOWS:\n", safeStringify(raw, 200000));
       }
-      console.log("=========================================");
+      // console.log("=========================================");
       return { prompt, text: text ?? null, raw };
     }
 
@@ -210,7 +210,7 @@ export async function askGemini(query, context, options = {}) {
   } catch (err) {
     console.error("[GEMINI] call error:", err?.response ?? err?.message ?? err);
     if (debug) {
-      console.log("FULL PROMPT (debug):\n", prompt);
+      // console.log("FULL PROMPT (debug):\n", prompt);
       return { error: "internal error", err: String(err), prompt };
     }
     return "Sorry, I couldn't generate a response due to an internal error.";
