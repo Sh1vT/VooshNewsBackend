@@ -1,270 +1,245 @@
-// services/ragService.js
-// Final drop-in RAG service — lazy init, Cohere v2, Qdrant js client
-// Exports: getContextWithHits (existing), qdrantClient(), cfg()
+// backend/services/ragService.js
+/**
+ * RAG service — uses Jina embeddings (HTTP) + Qdrant REST search.
+ *
+ * Exports:
+ *   - getContextWithHits(query, top_k = 5)
+ *
+ * Environment variables expected (same style as your other services):
+ *   JINA_API_KEY       - required (for jina.ai HTTP embedding)
+ *   JINA_MODEL         - optional (defaults to jina-embeddings-v2-base-en)
+ *   QDRANT_HOST        - required, full URL e.g. https://<host>:6333 or https://<cloud-host>
+ *   QDRANT_API_KEY     - optional (if your Qdrant requires an API key)
+ *   COLLECTION_NAME    - optional (default voosh_news_v1)
+ *
+ * Notes:
+ *  - This implementation uses global fetch (Node 18+). If your Node version lacks fetch,
+ *    install node-fetch and adapt the top of this file.
+ */
 
-import { CohereClientV2 } from "cohere-ai";
-import { QdrantClient } from "@qdrant/js-client-rest";
+import assert from "assert";
 
-/* singletons for lazy init */
-let _cohere = null;
-let _qdrant = null;
-let _cfg = null;
+const JINA_API_KEY = process.env.JINA_API_KEY;
+const JINA_MODEL = process.env.JINA_MODEL || "jina-embeddings-v2-base-en";
 
-export function cfg() {
-  if (_cfg) return _cfg;
-  _cfg = {
-    CO_API_KEY: process.env.CO_API_KEY || process.env.COHERE_API_KEY,
-    COHERE_MODEL: process.env.COHERE_MODEL || process.env.COHERE_MODEL || process.env.EMBEDDING_MODEL || "embed-english-light-v3.0",
-    COHERE_TIMEOUT_MS: parseInt(process.env.COHERE_TIMEOUT_MS || "15000", 10),
+const QDRANT_HOST = process.env.QDRANT_HOST;
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY || "";
+const COLLECTION_NAME = process.env.COLLECTION_NAME || "voosh_news_v1";
 
-    QDRANT_HOST: process.env.QDRANT_HOST,
-    QDRANT_API_KEY: process.env.QDRANT_API_KEY || undefined,
-    COLLECTION_NAME: process.env.COLLECTION_NAME || "voosh_news_v1",
-    QDRANT_TIMEOUT_MS: parseInt(process.env.QDRANT_TIMEOUT_MS || "15000", 10),
+if (!JINA_API_KEY) {
+  console.warn("[RAG] JINA_API_KEY not set — embedding calls will fail until configured.");
+}
+if (!QDRANT_HOST) {
+  throw new Error("QDRANT_HOST must be defined in env");
+}
 
-    DEFAULT_TOP_K: parseInt(process.env.DEFAULT_TOP_K || "5", 10),
-
-    // tuneable runtime params
-    MAX_CONTEXT_CHARS: parseInt(process.env.MAX_CONTEXT_CHARS || "1500", 10),
-    MAX_HITS_TO_CONSIDER: parseInt(process.env.MAX_HITS_TO_CONSIDER || "20", 10),
-    MAX_HITS_IN_CONTEXT: parseInt(process.env.MAX_HITS_IN_CONTEXT || "5", 10),
-    TITLE_BOOST_ALPHA: parseFloat(process.env.TITLE_BOOST_ALPHA || "0.12"),
+// small helper to perform HTTP fetch with optional Qdrant API key and JSON handling
+async function httpPost(url, bodyObj, headers = {}, timeoutMs = 30_000) {
+  const opts = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...headers,
+    },
+    body: JSON.stringify(bodyObj),
   };
-  return _cfg;
-}
 
-export function cohereClient() {
-  if (_cohere) return _cohere;
-  const c = cfg();
-  _cohere = new CohereClientV2({ token: c.CO_API_KEY });
-  return _cohere;
-}
-
-export function qdrantClient() {
-  if (_qdrant) return _qdrant;
-  const c = cfg();
-  _qdrant = c.QDRANT_HOST
-    ? new QdrantClient({ url: c.QDRANT_HOST, apiKey: c.QDRANT_API_KEY, checkCompatibility: false })
-    : new QdrantClient({ url: "http://127.0.0.1:6333", checkCompatibility: false });
-  return _qdrant;
-}
-
-/* Robust embedding extraction for v2 */
-function extractEmbedding(resp) {
-  if (!resp) return null;
-  if (resp.embeddings && typeof resp.embeddings === "object") {
-    if (Array.isArray(resp.embeddings.float) && resp.embeddings.float.length > 0) return resp.embeddings.float[0];
-    if (Array.isArray(resp.embeddings) && resp.embeddings.length > 0) {
-      const f = resp.embeddings[0];
-      if (Array.isArray(f)) return f;
-      if (f && Array.isArray(f.embedding)) return f.embedding;
-    }
+  // attach Qdrant API key if provided
+  if (QDRANT_API_KEY && url.startsWith(QDRANT_HOST)) {
+    // Qdrant cloud sometimes expects 'api-key' header
+    opts.headers["api-key"] = QDRANT_API_KEY;
   }
-  if (Array.isArray(resp.embeddings) && resp.embeddings.length > 0) {
-    const first = resp.embeddings[0];
-    if (Array.isArray(first)) return first;
-    if (typeof first === "number") return resp.embeddings;
-  }
-  if (Array.isArray(resp.data) && resp.data.length > 0) {
-    if (Array.isArray(resp.data[0].embedding)) return resp.data[0].embedding;
-    if (Array.isArray(resp.data[0].embeddings) && Array.isArray(resp.data[0].embeddings[0])) return resp.data[0].embeddings[0];
-  }
-  if (resp.body) return extractEmbedding(resp.body);
-  return null;
-}
 
-export async function embedWithCohere(text) {
-  if (!text || !String(text).trim()) throw new Error("embedWithCohere: empty text");
-  const c = cfg();
-  const client = cohereClient();
-  const resp = await client.embed({ model: c.COHERE_MODEL, inputType: "search_query", texts: [text] }, { timeout: c.COHERE_TIMEOUT_MS });
-  const emb = resp.embeddings?.float?.[0] ?? resp.embeddings?.[0] ?? resp.data?.[0]?.embedding ?? extractEmbedding(resp);
-  if (!emb || !Array.isArray(emb)) throw new Error("Cohere embed returned unexpected shape");
-  return emb;
-}
-
-export async function qdrantSearch(vector, topK) {
-  const c = cfg();
-  const client = qdrantClient();
-  const resp = await client.search(c.COLLECTION_NAME, { vector, limit: topK, with_payload: true }, { timeout: c.QDRANT_TIMEOUT_MS });
-
-  if (Array.isArray(resp)) return resp;
-  if (Array.isArray(resp?.result)) return resp.result;
-  if (Array.isArray(resp?.data)) return resp.data;
-  if (Array.isArray(resp?.hits)) return resp.hits;
-  return [];
-}
-
-/* simple tokenizer for title match */
-function simpleTokens(s) {
-  if (!s) return [];
-  return String(s).toLowerCase().split(/[\s\W]+/).filter(Boolean);
-}
-function titleMatchScore(query, title) {
-  if (!query || !title) return 0;
-  const q = simpleTokens(query);
-  const t = new Set(simpleTokens(title));
-  if (q.length === 0) return 0;
-  let c = 0;
-  for (const tok of q) if (t.has(tok)) c++;
-  return c / q.length;
-}
-
-/* improved safeTruncate: prefer sentence end, else whitespace boundary, else back off a bit */
-function safeTruncate(text, maxChars) {
-  if (!text) return "";
-  if (text.length <= maxChars) return text;
-  // initial cut
-  let cut = text.slice(0, maxChars);
-  // prefer sentence-ending punctuation followed by space
-  const sentenceEndMatch = cut.match(/([.!?])\s(?!.*[.!?]\s)/); // last sentence end in cut
-  if (sentenceEndMatch) {
-    const idx = cut.lastIndexOf(sentenceEndMatch[1] + " ");
-    if (idx > Math.floor(maxChars * 0.3)) {
-      return cut.slice(0, idx + 1).trim() + " ...";
-    }
-  }
-  // fallback: cut to last whitespace
-  const lastSpace = cut.lastIndexOf(" ");
-  if (lastSpace > Math.floor(maxChars * 0.25)) {
-    return cut.slice(0, lastSpace).trim() + " ...";
-  }
-  // final fallback: back off a bit to avoid broken token (back 8 chars)
-  const backoff = Math.max(0, maxChars - 8);
-  return text.slice(0, backoff).trim() + " ...";
-}
-
-/* payload extraction */
-function payloadText(payload) {
-  if (!payload) return "";
-  if (typeof payload === "string") return payload;
-  return (
-    payload.text ||
-    payload.content ||
-    payload.chunk ||
-    payload.body ||
-    payload.summary ||
-    payload.description ||
-    payload.article ||
-    payload.excerpt ||
-    payload.title ||
-    ""
-  );
-}
-
-/* final public function */
-export async function getContextWithHits(query, topK = null) {
-  const c = cfg();
-  topK = topK ?? c.DEFAULT_TOP_K;
-
-  if (!query || !String(query).trim()) return { context: "", hits: [], top_k_used: topK };
-
-  // 1) embed
-  let qemb;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    qemb = await embedWithCohere(query);
-  } catch (e) {
-    return { context: "", hits: [], top_k_used: topK, error: `Cohere embed failed: ${e?.message || e}` };
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(id);
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch (e) {
+      // not JSON
+    }
+    if (!res.ok) {
+      const errMsg = `HTTP ${res.status} ${res.statusText} from ${url} - body: ${text}`;
+      const err = new Error(errMsg);
+      err.__raw = { status: res.status, body: text, parsed: json };
+      throw err;
+    }
+    return json;
+  } finally {
+    clearTimeout(id);
   }
+}
 
-  // 2) qdrant search
-  let rawHits;
+/* -------------------------
+   Jina embedding wrapper (HTTP)
+   -------------------------
+   Uses: POST https://api.jina.ai/v1/embeddings
+   Body: { model: "<model>", input: ["...", ...] }
+   Response: { data: [{ embedding: [...] }, ...], ... }
+*/
+async function embedWithJina(texts = []) {
+  if (!Array.isArray(texts)) texts = [String(texts)];
+  if (!JINA_API_KEY) throw new Error("JINA_API_KEY not configured");
+
+  const url = "https://api.jina.ai/v1/embeddings";
+  const headers = {
+    Authorization: `Bearer ${JINA_API_KEY}`,
+  };
+  const body = { model: JINA_MODEL, input: texts };
+
   try {
-    rawHits = await qdrantSearch(qemb, topK);
-  } catch (e) {
-    return { context: "", hits: [], top_k_used: topK, error: `Qdrant search failed: ${e?.message || e}` };
-  }
-
-  // 3) normalize
-  const normalized = (rawHits || []).map((h) => ({
-    id: h.id ?? h._id ?? null,
-    score: typeof h.score === "number" ? h.score : (h.payload_score ?? null),
-    payload: h.payload ?? h,
-  }));
-
-  // 4) lightweight rescoring by title match
-  const alpha = c.TITLE_BOOST_ALPHA;
-  const rescored = normalized.map((h) => {
-    const title = (h.payload && (h.payload.title || h.payload.headline || h.payload.name)) || "";
-    const match = titleMatchScore(query, title);
-    const newScore = (h.score ?? 0) + alpha * match;
-    return { ...h, score: newScore, _title_match: match };
-  });
-
-  // 5) dedupe by source/title keep highest score
-  const consider = rescored.slice(0, c.MAX_HITS_TO_CONSIDER);
-  const map = new Map();
-  for (const h of consider) {
-    const p = h.payload || {};
-    const key = (p.url || p.source || p.link || p.title || h.id || "").toString().trim();
-    if (!key) {
-      const idKey = `__id__:${h.id ?? Math.random().toString(36).slice(2,8)}`;
-      if (!map.has(idKey)) map.set(idKey, h);
-      else if ((h.score ?? 0) > (map.get(idKey).score ?? 0)) map.set(idKey, h);
-      continue;
+    const json = await httpPost(url, body, headers, 30_000);
+    if (!json) throw new Error("Empty response from Jina embeddings");
+    if (Array.isArray(json.data)) {
+      const embeddings = json.data.map((item, i) => {
+        if (item && Array.isArray(item.embedding)) return item.embedding;
+        // Try other shapes
+        if (item && item.values && Array.isArray(item.values)) return item.values;
+        throw new Error(`Unexpected embedding item shape at index ${i}: ${JSON.stringify(item).slice(0,200)}`);
+      });
+      return embeddings;
     }
-    if (!map.has(key)) map.set(key, h);
-    else if ((h.score ?? 0) > (map.get(key).score ?? 0)) map.set(key, h);
+    // fallback if API returns direct list of vectors
+    if (Array.isArray(json)) return json;
+    throw new Error("Unrecognized Jina response shape for embeddings");
+  } catch (err) {
+    // bubble up with context
+    console.error("[RAG][JINA] embed error:", err?.message || err);
+    throw err;
   }
+}
 
-  // 6) sort by score desc
-  let deduped = Array.from(map.values());
-  deduped.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+/* -------------------------
+   Qdrant search wrapper (REST)
+   -------------------------
+   Uses /collections/{collection}/points/search or /collections/{collection}/points/search
+   We call the search API with a vector and get payloads back.
+*/
+async function qdrantSearchByVector(vector, topK = 5) {
+  assert(Array.isArray(vector) && vector.length > 0, "vector must be non-empty array");
+  const url = `${QDRANT_HOST.replace(/\/$/, "")}/collections/${encodeURIComponent(COLLECTION_NAME)}/points/search`;
+  const body = {
+    vector,
+    // use 'limit' field for number of neighbors
+    limit: Math.max(1, Number(topK) || 5),
+    with_payload: true,
+    with_vector: false,
+  };
 
-  // 7) build context pieces with deduped top hits and safe truncation
-  const pieces = [];
-  let chars = 0;
-  for (let i = 0; i < Math.min(deduped.length, c.MAX_HITS_IN_CONTEXT); i++) {
-    const h = deduped[i];
-    const p = h.payload || {};
-    const title = p.title ? String(p.title).trim() : "";
-    let snippet = String(payloadText(p) || "").trim();
-
-    // Avoid repeating the title in the snippet if snippet starts with title text
-    if (title && snippet) {
-      const snippetLower = snippet.toLowerCase();
-      const titleLower = title.toLowerCase();
-      if (snippetLower.startsWith(titleLower)) {
-        // remove leading title from snippet (plus any punctuation/newline)
-        snippet = snippet.slice(title.length).replace(/^[\s:–—\-]+/, "").trim();
-      }
-    }
-
-    // Ensure Source appears on its own line
-    const sourceLine = p.url ? `\nSource: ${p.url}` : p.source ? `\nSource: ${p.source}` : "";
-
-    const pieceBase = title ? `${title}\n` : "";
-    const fullPiece = (pieceBase + snippet + sourceLine).trim();
-    if (!fullPiece) continue;
-
-    const remaining = c.MAX_CONTEXT_CHARS - chars;
-    if (remaining <= 80) break; // safety margin
-    if (fullPiece.length <= remaining) {
-      pieces.push(fullPiece);
-      chars += fullPiece.length + 2;
-    } else {
-      const safe = safeTruncate(fullPiece, Math.max(80, remaining - 3));
-      pieces.push(safe);
-      chars += safe.length + 2;
-      break;
-    }
-  }
-
-  const context = pieces.join("\n\n");
-
-  // 8) mapped hits
-  const mappedHits = deduped.map((h) => {
-    const p = h.payload || {};
-    return {
+  try {
+    const json = await httpPost(url, body, {}, 30_000);
+    // Qdrant typical response: {result: [{id, payload, score}, ...], status: 'ok'}
+    const hits = Array.isArray(json?.result) ? json.result : Array.isArray(json) ? json : [];
+    return hits.map((h) => ({
       id: h.id,
-      score: h.score,
-      payload: {
-        ...p,
-        source: p.url || p.source || p.link || p.title || null,
-        _title_match: h._title_match ?? 0,
-      },
-    };
-  });
-
-  return { context, hits: mappedHits, top_k_used: topK };
+      score: h.score ?? h.payload?.score ?? null,
+      payload: h.payload ?? {},
+    }));
+  } catch (err) {
+    console.error("[RAG][QDRANT] search error:", err?.message || err);
+    throw err;
+  }
 }
+
+/* -------------------------
+   getContextWithHits(query, top_k)
+   - Embeds query with Jina
+   - Searches Qdrant for top_k
+   - Builds a single 'context' string containing top passages concatenated
+   - Returns { context, hits, top_k_used }
+*/
+export async function getContextWithHits(query, top_k = 5) {
+  const topK = Number(top_k) || 5;
+  if (!query || String(query).trim().length === 0) {
+    return { context: "", hits: [], top_k_used: 0 };
+  }
+
+  // 1) embed the query
+  let qVec;
+  try {
+    const embeddings = await embedWithJina([String(query)]);
+    if (!Array.isArray(embeddings) || embeddings.length === 0) {
+      throw new Error("Empty embedding returned from Jina");
+    }
+    qVec = embeddings[0];
+  } catch (err) {
+    console.warn("[RAG] Embedding failed:", err?.message || err);
+    // return empty context so caller can fallback gracefully
+    return { context: "", hits: [], top_k_used: 0 };
+  }
+
+  // 2) query Qdrant
+  let hits = [];
+  try {
+    hits = await qdrantSearchByVector(qVec, topK);
+  } catch (err) {
+    console.warn("[RAG] Qdrant search failed:", err?.message || err);
+    return { context: "", hits: [], top_k_used: 0 };
+  }
+
+  // 3) Build context: choose a readable concatenation of top passages (limit length)
+  //    Each hit.payload is expected to have `text` and `url` fields (based on your indexer).
+  const MAX_CONTEXT_CHARS = 4000; // tune for model prompt size
+  const parts = [];
+  for (const h of hits) {
+    const text = (h.payload && (h.payload.text || h.payload.excerpt || h.payload.content)) || "";
+    const title = (h.payload && (h.payload.title || h.payload.headline)) || null;
+    const source = (h.payload && (h.payload.url || h.payload.source)) || null;
+    let snippet = text;
+    if (snippet && snippet.length > 2000) snippet = snippet.slice(0, 2000) + "…";
+    let piece = "";
+    if (title) piece += `${title}\n`;
+    if (snippet) piece += `${snippet}\n`;
+    if (source) piece += `Source: ${source}\n`;
+    if (piece.trim()) parts.push(piece.trim());
+    // stop if context would grow too large
+    const curLen = parts.join("\n\n").length;
+    if (curLen >= MAX_CONTEXT_CHARS) break;
+  }
+
+  const context = parts.join("\n\n");
+  return { context, hits, top_k_used: hits.length };
+}
+
+/* -------------------------
+   Optional helper: getContextAndAnswer(query, askFunction)
+   - Convenience wrapper that builds context and calls a model-asking function (e.g. Gemini or other)
+   - Not exported by default, but you can use it in your higher-level handlers.
+*/
+export async function getContextAndAnswer(query, askFn, top_k = 5, options = {}) {
+  const { context, hits, top_k_used } = await getContextWithHits(query, top_k);
+  let answer = "Sorry, something went wrong.";
+  if (!context || context.length === 0) {
+    return { answer, context, hits, top_k_used };
+  }
+  try {
+    // askFn should be a function like askGemini(query, context)
+    answer = await askFn(query, context, options);
+  } catch (err) {
+    console.warn("[RAG] askFn error:", err?.message || err);
+    answer = "Sorry, I couldn't generate a response.";
+  }
+  return { answer, context, hits, top_k_used };
+}
+
+/* -------------------------
+   Quick local test helper (uncomment to run locally)
+   -------------------------
+(async () => {
+  try {
+    const res = await getContextWithHits("Who is the president of France?", 5);
+    console.log("context len:", res.context.length, "hits:", res.hits.length);
+  } catch (e) {
+    console.error(e);
+  }
+})();
+*/
+
+export default {
+  getContextWithHits,
+  getContextAndAnswer,
+};
