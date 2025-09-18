@@ -162,7 +162,7 @@ async function callModelWithManySignatures(model, prompt) {
 export async function askGemini(query, context, options = {}) {
   const debug = options.debug === true;
   const model = initClient();
-  const prompt = `Talk as a bot from an organization (using We). Context has been attached but you dont need to mention that to the user. Answer the following query using ONLY the context provided. Include sources. Use markdowns to document better. If you lack context then say you dont have enough sources or no sources. \n\nContext:\n${context}\n\nQuestion: ${query}`;
+  const prompt = `Answer the following query using ONLY the context provided. Include sources.\n\nContext:\n${context}\n\nQuestion: ${query}`;
 
   // console.log("[GEMINI] prompt length:", prompt.length);
   // console.log("[GEMINI] prompt preview:", (prompt || "").slice(0, 1200));
