@@ -19,7 +19,7 @@ app.use(express.json());
 
 // mount existing chat/session routes under /api to match frontend API_BASE_URL = "/api"
 app.use("/chat", chatRoutes);
-app.use("/ession", sessionRoutes);
+app.use("/session", sessionRoutes);
 
 // add featured endpoint at /api/featured
 app.use("/featured", featuredRoute);
